@@ -1,0 +1,153 @@
+name: REA — Análise de Projetos (laboratório)
+
+# Workflow próprio do laboratório phantvxagent.
+# Não substitui os workflows de CI do upstream (ci.yml etc.) — é um agregado:
+# roda o REA distribuído no npm sobre o alvo que você escolher, publica o
+# relatório como artifact e imprime o resumo no log.
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_path:
+        description: "Caminho (relativo ao repo) do projeto/app a analisar. Use '.' para a raiz."
+        required: true
+        default: "."
+      mode:
+        description: "Tipo de análise"
+        required: true
+        type: choice
+        default: "auto"
+        options:
+          - auto            # detecta o que for possível e roda (JS/Electron, artefatos, firmware)
+          - javascript      # aplicação JavaScript / Electron (ASAR, source maps, IPC)
+          - artifact        # inventário de pacote/artefato (asar, zip, digests)
+          - native          # binário nativo via Ghidra (exige instalar Ghidra no runner)
+      runner:
+        description: "Runner (arquitetura)"
+        required: true
+        type: choice
+        default: "ubuntu-latest"
+        options:
+          - ubuntu-latest        # x64 — cobre TODOS os módulos (inclusive Android/ELF x64-only)
+          - ubuntu-24.04-arm     # arm64 — módulos nativos/JS; sem JADX/pwntools
+  push:
+    branches: [main]
+    paths:
+      - ".rea-lab/**"
+
+permissions:
+  contents: read
+
+env:
+  HUSKY: "0"
+  REA_VERSION: "latest"
+
+jobs:
+  analyze:
+    name: Análise REA (${{ github.event_name == 'workflow_dispatch' && inputs.runner || 'ubuntu-latest' }} · ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'auto' }})
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner || 'ubuntu-latest' }}
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24.11.0"
+
+      - name: Info do ambiente
+        run: |
+          echo "arch=$(uname -m)"
+          node --version
+          npm --version
+
+      - name: Instalar REA (npm público)
+        run: |
+          npm install --global "rea-agents@${REA_VERSION}"
+          rea --help || true
+          rea providers --json > rea-providers.json 2>&1 || true
+          rea capabilities --json > rea-capabilities.json 2>&1 || true
+          echo "--- providers ---"; cat rea-providers.json || true
+
+      - name: Resolver alvo
+        id: tgt
+        run: |
+          TARGET="${{ github.event_name == 'workflow_dispatch' && inputs.target_path || '.' }}"
+          MODE="${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'auto' }}"
+          echo "target=$TARGET" >> "$GITHUB_OUTPUT"
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "Alvo: $TARGET · modo: $MODE"
+          echo "Arquivos no alvo:"; ls -la "$TARGET" | head -40
+
+      - name: Análise — JavaScript/Electron
+        if: ${{ (github.event_name == 'workflow_dispatch' && (inputs.mode == 'javascript' || inputs.mode == 'auto')) }}
+        continue-on-error: true
+        run: |
+          mkdir -p .rea-lab/out
+          echo "## REA · JavaScript/Electron" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f "${{ steps.tgt.outputs.target }}/package.json" ] || ls "${{ steps.tgt.outputs.target }}"/*.asar >/dev/null 2>&1; then
+            rea analyze-javascript-application "${{ steps.tgt.outputs.target }}" --json \
+              > .rea-lab/out/javascript-evidence.json 2> .rea-lab/out/javascript.err || true
+            echo "js_exit=$?" >> "$GITHUB_OUTPUT.guard" 2>/dev/null || true
+            echo '```json' >> "$GITHUB_STEP_SUMMARY"
+            head -c 4000 .rea-lab/out/javascript-evidence.json >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Alvo não parece ser app JS/Electron (sem package.json nem .asar) — pulando." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Análise — artefatos (inventário)
+        if: ${{ (github.event_name == 'workflow_dispatch' && (inputs.mode == 'artifact' || inputs.mode == 'auto')) }}
+        continue-on-error: true
+        run: |
+          mkdir -p .rea-lab/out
+          echo "## REA · Inventário de artefatos" >> "$GITHUB_STEP_SUMMARY"
+          # inventaria asar/zip do alvo, se houver
+          for f in $(find "${{ steps.tgt.outputs.target }}" -maxdepth 2 \( -name '*.asar' -o -name '*.zip' -o -name '*.apk' \) 2>/dev/null | head -5); do
+            echo "### $f" >> "$GITHUB_STEP_SUMMARY"
+            rea inspect-artifact "$f" --json >> .rea-lab/out/artifact-evidence.json 2>> .rea-lab/out/artifact.err || true
+          done
+          [ -s .rea-lab/out/artifact-evidence.json ] && echo "Artefatos inventariados: $(wc -c < .rea-lab/out/artifact-evidence.json) bytes" >> "$GITHUB_STEP_SUMMARY" || echo "Nenhum artefato encontrado." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Análise — binário nativo (Ghidra, opcional)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'native' }}
+        continue-on-error: true
+        env:
+          REA_ANALYSIS_PROVIDER: ghidra
+        run: |
+          mkdir -p .rea-lab/out
+          echo "## REA · Binário nativo (Ghidra)" >> "$GITHUB_STEP_SUMMARY"
+          echo "⚠️ Requer Ghidra instalado no runner. Se ausente, a operação falha de forma explícita." >> "$GITHUB_STEP_SUMMARY"
+          for f in $(find "${{ steps.tgt.outputs.target }}" -maxdepth 2 -type f \( -name '*.exe' -o -name '*.elf' -o -name '*.so' -o -name '*.dll' -o -name '*.bin' \) 2>/dev/null | head -5); do
+            echo "### $f" >> "$GITHUB_STEP_SUMMARY"
+            rea analyze "$f" --provider ghidra --json >> .rea-lab/out/native-evidence.json 2>> .rea-lab/out/native.err || true
+          done
+
+      - name: Consolidar resultado
+        run: |
+          {
+            echo "# REA — relatório do laboratório"
+            echo
+            echo "- **Runner:** \`$(uname -m)\` (\`${{ github.event_name == 'workflow_dispatch' && inputs.runner || 'ubuntu-latest' }}\`)"
+            echo "- **Alvo:** \`${{ steps.tgt.outputs.target }}\`"
+            echo "- **Modo:** \`${{ steps.tgt.outputs.mode }}\`"
+            echo "- **REA:** \`$(rea --version 2>/dev/null || echo '?')\`"
+            echo
+            echo "## Providers detectados"
+            echo '```json'; head -c 3000 rea-providers.json 2>/dev/null || echo '(sem saída)'; echo '```'
+          } > .rea-lab/out/REPORT.md
+          cat .rea-lab/out/REPORT.md
+
+      - name: Publicar artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rea-analysis-${{ github.run_id }}
+          path: |
+            .rea-lab/out/
+            rea-providers.json
+            rea-capabilities.json
+          if-no-files-found: warn
+          retention-days: 30
